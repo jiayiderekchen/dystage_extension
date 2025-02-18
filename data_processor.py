@@ -78,6 +78,19 @@ class DataProcessor:
                        ['datadate', 'cusip', 'ticker', 'ret', 'news_text', 'pos', 'neg', 'neu']]
         df = self.normalize_features(df, feature_cols)
         
+        # Ensure all features are calculated using only past data
+        df = df.sort_values('datadate')
+        
+        # Calculate rolling features with proper shifts
+        df['rolling_mean'] = df.groupby('ticker')['ret'].transform(lambda x: x.shift(1).rolling(window=20).mean())
+        df['rolling_std'] = df.groupby('ticker')['ret'].transform(lambda x: x.shift(1).rolling(window=20).std())
+        
+        # Ensure target variable is future return
+        df['ret'] = df.groupby('ticker')['ret'].shift(-1)  # Next day's return
+        
+        # Remove rows with future data leakage
+        df = df.dropna(subset=['ret'])
+        
         # Save processed data if requested
         if save_processed:
             print(f"Saving processed data to {processed_data_path}")

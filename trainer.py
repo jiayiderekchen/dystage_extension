@@ -2,7 +2,8 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+from sklearn.metrics import mean_absolute_percentage_error  # for MAPE
 import os
 from tqdm import tqdm
 import pandas as pd
@@ -40,6 +41,7 @@ class ModelTrainer:
         self.model.train()
         total_loss = 0
         
+        # Process batches in order
         for features, targets in tqdm(train_loader, desc="Training"):
             features = features.to(self.device)
             targets = targets.to(self.device)
@@ -73,15 +75,27 @@ class ModelTrainer:
                 all_preds.extend(outputs.cpu().numpy())
                 all_targets.extend(targets.cpu().numpy())
         
-        mse = mean_squared_error(all_targets, all_preds)
+        # Convert to numpy arrays for metric calculation
+        all_preds = np.array(all_preds)
+        all_targets = np.array(all_targets)
+        
+        # Calculate RMSE and MAE
+        rmse = np.sqrt(mean_squared_error(all_targets, all_preds))
         mae = mean_absolute_error(all_targets, all_preds)
-        r2 = r2_score(all_targets, all_preds)
+        
+        # Calculate MAPE with clipping
+        def mape_clip(label, pred, threshold=0.1):
+            v = np.clip(np.abs(label), threshold, None)
+            diff = np.abs((label - pred) / v)
+            return 100.0 * np.mean(diff)
+        
+        mape = mape_clip(all_targets, all_preds)
         
         return {
             'loss': total_loss / len(val_loader),
-            'mse': mse,
+            'rmse': rmse,
             'mae': mae,
-            'r2': r2
+            'mape': mape
         }
     
     def save_checkpoint(self, epoch, metrics, path):
@@ -102,9 +116,9 @@ class ModelTrainer:
             print(f"Epoch {epoch+1}/{self.config['epochs']}")
             print(f"Train Loss: {train_loss:.4f}")
             print(f"Val Loss: {val_metrics['loss']:.4f}")
-            print(f"Val MSE: {val_metrics['mse']:.4f}")
+            print(f"Val RMSE: {val_metrics['rmse']:.4f}")
             print(f"Val MAE: {val_metrics['mae']:.4f}")
-            print(f"Val R2: {val_metrics['r2']:.4f}")
+            print(f"Val MAPE: {val_metrics['mape']:.2f}%")
             
             # Save checkpoint
             self.save_checkpoint(
@@ -113,9 +127,9 @@ class ModelTrainer:
                 f"checkpoints/model_epoch_{epoch+1}.pt"
             )
             
-            # Save best model
-            if val_metrics['loss'] < self.best_val_loss:
-                self.best_val_loss = val_metrics['loss']
+            # Save best model based on RMSE
+            if val_metrics['rmse'] < self.best_val_loss:
+                self.best_val_loss = val_metrics['rmse']
                 self.patience_counter = 0
                 torch.save(self.model.state_dict(), 'best_model.pt')
             else:
@@ -126,53 +140,93 @@ class ModelTrainer:
                 print(f"Early stopping triggered after {epoch+1} epochs")
                 break 
     
-    def compute_feature_importance(self, train_loader, feature_names, n_background=100):
-        """Compute feature importance using SHAP"""
+    def compute_feature_importance(self, train_loader, feature_names):
+        """
+        Compute feature importance using SHAP GradientExplainer
+        """
+        # Set model to eval mode
         self.model.eval()
         
-        # Convert train_loader to numpy array for SHAP
-        background_data = []
-        for features, _ in train_loader:
-            background_data.append(features.numpy())
-            if len(background_data) * features.shape[0] >= n_background:
-                break
-        background_data = np.concatenate(background_data)[:n_background]
+        # Create a wrapper for the model to reshape output
+        class ModelWrapper(nn.Module):
+            def __init__(self, model):
+                super().__init__()
+                self.model = model
+            
+            def forward(self, x):
+                return self.model(x).unsqueeze(-1)  # Add extra dimension for SHAP
         
-        # Define model wrapper for SHAP
-        def model_wrapper(x):
+        wrapped_model = ModelWrapper(self.model)
+        wrapped_model.to(self.device)
+        
+        # Get a batch of background data
+        background_data = next(iter(train_loader))[0].to(self.device)
+        
+        # Initialize the SHAP explainer
+        explainer = shap.GradientExplainer(
+            model=wrapped_model,
+            data=background_data,
+        )
+        
+        # Get a smaller subset of data for SHAP analysis
+        n_samples = min(100, len(train_loader.dataset))
+        sample_indices = torch.randperm(len(train_loader.dataset))[:n_samples]
+        sample_data = torch.stack([train_loader.dataset[i][0] for i in sample_indices]).to(self.device)
+        
+        try:
+            # Calculate SHAP values
+            shap_values = explainer.shap_values(sample_data)
+            
+            # If shap_values is a list (multiple outputs), take the first element
+            if isinstance(shap_values, list):
+                shap_values = shap_values[0]
+            
+            # Remove extra dimension if present
+            if len(shap_values.shape) > 2:
+                shap_values = shap_values.squeeze(-1)
+            
+            # Calculate mean absolute SHAP values for each feature
+            mean_abs_shap = np.abs(shap_values).mean(axis=0)
+            
+            # Create DataFrame with feature importance
+            importance_df = pd.DataFrame({
+                'feature': feature_names,
+                'importance': mean_abs_shap
+            })
+            importance_df = importance_df.sort_values('importance', ascending=False)
+            
+            # Create and save SHAP summary plot
+            plt.figure(figsize=(10, 6))
+            shap.summary_plot(
+                shap_values, 
+                sample_data.cpu().numpy(), 
+                feature_names=feature_names, 
+                show=False
+            )
+            plt.savefig('shap_summary_plot.png')
+            plt.close()
+            
+            return importance_df, shap_values
+            
+        except Exception as e:
+            print(f"Error in SHAP computation: {str(e)}")
+            print("Falling back to simple feature importance calculation...")
+            
+            # Fallback to a simpler feature importance calculation
+            importance = []
             with torch.no_grad():
-                x_tensor = torch.FloatTensor(x).to(self.device)
-                return self.model(x_tensor).cpu().numpy()
-        
-        # Initialize SHAP explainer
-        explainer = shap.DeepExplainer(model_wrapper, background_data)
-        
-        # Calculate SHAP values
-        shap_values = []
-        for features, _ in tqdm(train_loader, desc="Computing SHAP values"):
-            batch_shap_values = explainer.shap_values(features.numpy())
-            shap_values.append(batch_shap_values)
-        
-        # Combine all SHAP values
-        shap_values = np.concatenate(shap_values)
-        
-        # Calculate feature importance based on mean absolute SHAP values
-        feature_importance = np.mean(np.abs(shap_values), axis=0)
-        
-        # Create DataFrame with feature names and importance scores
-        importance_df = pd.DataFrame({
-            'feature': feature_names,
-            'importance': feature_importance
-        })
-        
-        # Sort by importance
-        importance_df = importance_df.sort_values('importance', ascending=False)
-        
-        # Create SHAP summary plot
-        plt.figure(figsize=(10, 6))
-        shap.summary_plot(shap_values, background_data, feature_names=feature_names, show=False)
-        plt.tight_layout()
-        plt.savefig('shap_summary_plot.png')
-        plt.close()
-        
-        return importance_df, shap_values 
+                for i in range(sample_data.shape[1]):
+                    # Zero out one feature at a time and measure the change in output
+                    modified_data = sample_data.clone()
+                    modified_data[:, i] = 0
+                    original_output = self.model(sample_data)
+                    modified_output = self.model(modified_data)
+                    importance.append(torch.abs(original_output - modified_output).mean().item())
+            
+            importance_df = pd.DataFrame({
+                'feature': feature_names,
+                'importance': importance
+            })
+            importance_df = importance_df.sort_values('importance', ascending=False)
+            
+            return importance_df, None 

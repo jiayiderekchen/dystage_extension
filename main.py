@@ -8,6 +8,37 @@ from torch.utils.data import DataLoader
 import os
 import argparse
 from datetime import datetime
+import torch
+
+def time_series_split(df, feature_cols, test_size=0.15, val_size=0.15):
+    """
+    Split time series data chronologically into train, validation, and test sets
+    Train: 70%, Validation: 15%, Test: 15%
+    """
+    # Sort by date
+    df = df.sort_values('datadate')
+    
+    # Calculate split points
+    total_size = len(df)
+    test_index = int(total_size * (1 - test_size))
+    val_index = int(total_size * (1 - test_size - val_size))
+    
+    # Split data chronologically
+    train_df = df.iloc[:val_index]  # First 70%
+    val_df = df.iloc[val_index:test_index]  # Next 15%
+    test_df = df.iloc[test_index:]  # Last 15%
+    
+    # Prepare features and targets
+    def prepare_xy(data):
+        X = data[feature_cols].values
+        y = data['ret'].values
+        return X, y
+    
+    X_train, y_train = prepare_xy(train_df)
+    X_val, y_val = prepare_xy(val_df)
+    X_test, y_test = prepare_xy(test_df)
+    
+    return (X_train, X_val, X_test), (y_train, y_val, y_test)
 
 def main():
     # Add command line arguments
@@ -21,15 +52,20 @@ def main():
                        help='Path to raw data file')
     parser.add_argument('--processed_path', type=str, default='processed_data.pkl',
                        help='Path to processed data file')
+    parser.add_argument('--device', type=str, choices=['cuda', 'cpu'], default='cuda' if torch.cuda.is_available() else 'cpu',
+                       help='Device to use for training (cuda/cpu)')
     args = parser.parse_args()
     
     # Configuration
     config = {
         'learning_rate': 1e-5,
         'batch_size': 16,
-        'epochs': 10,
+        'epochs': 25,
         'early_stopping': 10,
+        'device': args.device
     }
+    
+    print(f"\nUsing device: {config['device']}")
     
     # Create checkpoints directory
     os.makedirs('checkpoints', exist_ok=True)
@@ -60,25 +96,42 @@ def main():
     # Prepare features and target
     feature_cols = [col for col in df.columns if col not in 
                    ['datadate', 'cusip', 'ticker', 'ret', 'news_text']]
-    X = df[feature_cols].values
-    y = df['ret'].values
     
-    # Split data
-    X_train, X_temp, y_train, y_temp = train_test_split(X, y, test_size=0.3, random_state=42)
-    X_val, X_test, y_val, y_test = train_test_split(X_temp, y_temp, test_size=0.5, random_state=42)
+    # Print data date range
+    print(f"\nData date range:")
+    print(f"Start date: {df['datadate'].min()}")
+    print(f"End date: {df['datadate'].max()}")
+    
+    # Handle NaN values in the data
+    df[feature_cols] = df[feature_cols].fillna(method='ffill').fillna(0)
+    df['ret'] = df['ret'].fillna(0)
+    
+    # Split data chronologically
+    (X_train, X_val, X_test), (y_train, y_val, y_test) = time_series_split(
+        df, 
+        feature_cols, 
+        test_size=0.15,  # 15% for test
+        val_size=0.15    # 15% for validation
+    )
+    
+    print("\nData split sizes:")
+    print(f"Training set: {len(X_train)} samples")
+    print(f"Validation set: {len(X_val)} samples")
+    print(f"Test set: {len(X_test)} samples")
     
     # Create datasets and dataloaders
     train_dataset = StockDataset(X_train, y_train)
     val_dataset = StockDataset(X_val, y_val)
     test_dataset = StockDataset(X_test, y_test)
     
-    train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True)
+    train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=False)  # No shuffling for time series
     val_loader = DataLoader(val_dataset, batch_size=config['batch_size'])
     test_loader = DataLoader(test_dataset, batch_size=config['batch_size'])
     
-    # Initialize model
+    # Initialize model and move to specified device
     input_dim = X_train.shape[1]
     model = TransformerEncoder(input_dim=input_dim)
+    model = model.to(config['device'])
     
     # Train model
     trainer = ModelTrainer(model, config)
@@ -101,17 +154,17 @@ def main():
     # Evaluate on test set
     test_metrics = trainer.evaluate(test_loader)
     print("\nTest Set Metrics:")
-    print(f"MSE: {test_metrics['mse']:.4f}")
+    print(f"RMSE: {test_metrics['rmse']:.4f}")
     print(f"MAE: {test_metrics['mae']:.4f}")
-    print(f"R2: {test_metrics['r2']:.4f}")
+    print(f"MAPE: {test_metrics['mape']:.2f}%")
     
     # Save test metrics with timestamp
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     metrics_df = pd.DataFrame({
         'timestamp': [timestamp],
-        'mse': [test_metrics['mse']],
+        'rmse': [test_metrics['rmse']],
         'mae': [test_metrics['mae']],
-        'r2': [test_metrics['r2']]
+        'mape': [test_metrics['mape']]
     })
     
     # Create or append to metrics file
