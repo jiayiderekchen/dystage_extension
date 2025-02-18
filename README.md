@@ -33,9 +33,9 @@ For features, Features are normalized to the range (-1, 1) before training.
 1. number of attention heads: 16
 
 ### evaluation metrics 
-1. MSE
+1. RMSE
 2. MAE
-3. R-squared
+3. MAPE
 4. feature importance at end of training  
 
 
